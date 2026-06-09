@@ -64,4 +64,121 @@
 Трафик PTPv2 (Синхронизация времени)
  Метка: DSCP EF (Код 46)  =======>  Аппаратная Queue 7 (Наивысший)   Трафик AES67 / Q-LAN (Аудиопотоки)
 ||  Метка: DSCP AF41 (Код 34) ======>  Аппаратная Queue 6 (Высокий)
-Данные управления, Скрипты, JSON-RPC, Веб-интерфейсы   Метка: DSCP 0 (Default)   =======>  Аппаратная Queue 0 (Низший)    
+Данные управления, Скрипты, JSON-RPC, Веб-интерфейсы   Метка: DSCP 0 (Default)   =======>  Аппаратная Queue 0 (Низший)
+
+```
+
+### 4.3. Энергосбережение:
+*   Функция **Green Ethernet (EEE / 802.3az)** должна быть **полностью отключена (Disabled)** на всех портах. Ее активация приводит к микро-задержкам прохождения пакетов PTPv2, что вызывает фатальные щелчки и выпадения звука.
+
+---
+
+## 5. СИНХРОНИЗАЦИЯ СВЕРХТОЧНОГО ВРЕМЕНИ (PTPv2)
+
+Тактование цифровых буферов осуществляется по протоколу **PTPv2 (IEEE 1588-2008)**. Роли устройств распределяются следующим образом:
+1.  **Grandmaster Clock:** Кинопроцессор **Dolby CP950**. Имеет приоритет встроенного генератора по умолчанию (`Priority 1 = 128`).
+2.  **Slave Devices:** Физический процессор **Q-SYS Core Nano** и усилители **CXD 8.8Q**. В настройках Q-SYS Core Manager параметры `PTP Priority 1` и `PTP Priority 2` принудительно выставляются в значение **254** (минимальный приоритет).
+
+*Результат:* Core Nano автоматически подчиняет свой тактовый генератор процессору Dolby, исключая джиттер и рассинхронизацию аудиопотока.
+
+---
+
+## 6. ВИРТУАЛЬНАЯ ИНФРАСТРУКТУРА НА LINUX (Q-SYS vCore)
+
+Использование виртуального процессора **Q-SYS vCore** в среде Linux (KVM/Proxmox) для обработки звука невозможно, так как производитель программно заблокировал в нем медиа-блоки (отсутствуют компоненты Q-LAN и AES67 Audio). 
+
+В данной архитектуре Linux-хост выполняет роль **выделенного центра IT-автоматизации, мониторинга и DevOps-диспетчеризации (Control & Monitoring Engine)**.
+
+### 6.1. Развертывание виртуальной машины vCore на Linux (Debian/Ubuntu)
+Сетевой интерфейс хоста настраивается в режиме сетевого моста для обеспечения прямой L2-видимости стойки:
+
+```bash
+# Конфигурация интерфейсов хоста /etc/network/interfaces
+auto br0
+iface br0 inet static
+    address 10.0.0.5
+    netmask 255.255.255.0
+    gateway 10.0.0.1
+    bridge_ports eth0
+    bridge_stp off
+    bridge_fd 0
+```
+Виртуальная машина vCore разворачивается в данном мосту с фиксированным IP-адресом `10.0.0.6`.
+
+### 6.2. Автоматизация сценариев киносеанса (Скрипт `automation.lua`)
+Скрипт разворачивается внутри vCore, непрерывно слушает логи Dolby CP950 по TCP-порту 61408 и управляет инженерными системами зала по IP:
+
+```lua
+-- Модуль автоматизации сценариев зала
+local Dolby_IP = "10.0.0.2"
+local Light_Controller_IP = "10.0.0.50"
+local DolbySocket = Network.TcpSocket.New()
+
+DolbySocket.DataHandler = function(socket, bytes)
+  local packet = socket:ReadString(bytes)
+  
+  -- Триггер: Начало воспроизведения фильма
+  if string.find(packet, "STATUS=PLAYING") then
+      Network.TcpSocket.Send(Light_Controller_IP, "SCENE=KINO_START\r")
+      print("[INFO] Сеанс запущен. Световой сценарий: Кино.")
+      
+  -- Триггер: Титры / Остановка фильма
+  elseif string.find(packet, "STATUS=STOPPED") then
+      Network.TcpSocket.Send(Light_Controller_IP, "SCENE=KINO_END\r")
+      print("[INFO] Сеанс окончен. Световой сценарий: Выход.")
+  end
+end
+
+DolbySocket.EventHandler = function(socket, event, err)
+  if event == Network.TcpSocket.Events.Connected then
+    print("[SUCCESS] Связь с Dolby CP950 установлена.")
+  elseif event == Network.TcpSocket.Events.Error then
+    print("[ERROR] Сбой связи с Dolby: " .. err)
+  end
+end
+
+-- Инициализация постоянного подключения
+DolbySocket:Connect(Dolby_IP, 61408)
+```
+
+### 6.3. Мониторинг здоровья стоек и Telegram-оповещения (`telemetry.lua`)
+Скрипт циклически опрашивает диагностические шины усилителей CXD 8.8Q и отправляет алерты в Telegram-канал техподдержки при перегреве или изменении импеданса:
+
+```lua
+-- Модуль DevOps телеметрии и алертинга
+local HttpClient = HttpClient.New()
+local CRITICAL_TEMP = 75.0 -- Порог срабатывания в градусах Цельсия
+local TG_TOKEN = "GLOBAL_TELEGRAM_BOT_TOKEN"
+local TG_CHAT_ID = "TARGET_TELEGRAM_CHAT_ID"
+
+function AuditRackHealth()
+  for amp_index = 1, 6 do
+    -- Запрос внутренней переменной температуры из Named Controls дизайна
+    local temp = NamedControl.GetValue("CXD_Amp_" .. amp_index .. "_CoreTemp")
+    
+    if temp and temp > CRITICAL_TEMP then
+      local payload = {
+        chat_id = TG_CHAT_ID,
+        text = string.format("🚨 [КРИТИЧЕСКИЙ СБОЙ] Зал 1. Усилитель QSC CXD 8.8Q №%d перегрет! Текущая температура: %.1f°C. Проверьте вентиляцию стойки!", amp_index, temp)
+      }
+      
+      HttpClient.Upload({
+        Url = "https://telegram.org" .. TG_TOKEN .. "/sendMessage",
+        Method = "POST",
+        Headers = { ["Content-Type"] = "application/json" },
+        Data = Json.Encode(payload)
+      })
+    end
+  end
+end
+
+-- Интервал сканирования датчиков: каждые 30 секунд
+Timer.CallEvery(AuditRackHealth, 30)
+```
+
+### 6.4. Визуализация в Grafana через JSON-RPC
+Для глубокого анализа логов на Linux-хосте развернут Docker-контейнер со скриптом-экспортером на Python. Он обращается к vCore по API, забирает сырые метрики токов, напряжений и температуры усилителей, форматирует их под Prometheus TSDB и отдает в **Grafana**. 
+
+Инженерная служба получает полноценные интерактивные графики нагрузки на все 52 канала звука в реальном времени.
+
+---
